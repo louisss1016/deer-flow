@@ -246,7 +246,8 @@ def test_json_output_uses_concise_review_record_schema(tmp_path: Path, capsys) -
         {
             "priority": "HIGH",
             "location": {
-                "path": str(source_file),
+                # The detector reports portable POSIX-style paths (as_posix).
+                "path": source_file.as_posix(),
                 "line": 4,
                 "column": 5,
                 "function": "handler",
