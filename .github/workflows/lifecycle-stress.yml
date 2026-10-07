@@ -1,0 +1,50 @@
+name: lifecycle-stress
+
+# Temporary verification workflow (fork-only, never merged upstream).
+# Runs tests/test_extension_task_lifecycle.py repeatedly on windows-latest to
+# prove the notification budget-exhaustion classification is deterministic
+# under the coarse Windows clock. See upstream issue #6453.
+
+on: [push, workflow_dispatch]
+
+jobs:
+  stress-windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.11.1"
+
+      - name: Install backend dependencies
+        run: uv sync --group dev
+
+      - name: Stress lifecycle suite x15 on Windows (coarse clock)
+        shell: bash
+        env:
+          PYTHONPATH: .
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
+        run: |
+          fail=0
+          for i in $(seq 1 15); do
+            echo "=== iteration $i/15 ==="
+            if ! uv run pytest tests/test_extension_task_lifecycle.py -q --tb=line; then
+              echo "STRESS_FAILURE at iteration $i"
+              fail=1
+            fi
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "STRESS RESULT: FAILED (misclassification reproduced)"
+            exit 1
+          fi
+          echo "STRESS RESULT: 15/15 green"
