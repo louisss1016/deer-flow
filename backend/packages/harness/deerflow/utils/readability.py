@@ -8,8 +8,31 @@ from urllib.parse import urljoin, urlparse, uses_relative
 from bs4 import BeautifulSoup
 from markdownify import markdownify as md
 from readabilipy import simple_json_from_html_string
+from readabilipy.extractors import extract_title
+from readabilipy.simple_json import have_node
 
 logger = logging.getLogger(__name__)
+
+
+def _simplified_body_html(html: str) -> str:
+    """Body markup with link and image destinations kept.
+
+    The destination-preserving counterpart to readabilipy's pure-Python lane
+    (``simple_tree_from_html_string``), used whenever Readability.js cannot
+    run. That lane calls ``strip_attributes`` early, which keeps only
+    ``class`` and ``style`` — so every ``<a href>`` and ``<img src>``
+    destination dies before Markdown conversion — and
+    ``simple_json_from_html_string(use_readability=True)`` degrades to it
+    *silently* on Node-less hosts (one stderr line only), which is how
+    ``web_fetch`` returned link-free Markdown on Windows. Here the same
+    body-only shape is produced without discarding the attributes
+    ``_resolve_html_urls`` has already made absolute.
+    """
+    soup = BeautifulSoup(html, "html5lib")
+    for tag in soup(["script", "style", "noscript", "template", "svg", "head"]):
+        tag.decompose()
+    container = soup.find(["article", "main"]) or soup.body or soup
+    return str(container)
 
 
 class Article:
@@ -154,20 +177,32 @@ class ReadabilityExtractor:
     def extract_article(self, html: str, *, url: str | None = None) -> Article:
         if url:
             html = _resolve_html_urls(html, url)
-        try:
-            article = simple_json_from_html_string(html, use_readability=True)
-        except (subprocess.CalledProcessError, FileNotFoundError) as exc:
-            stderr = getattr(exc, "stderr", None)
-            if isinstance(stderr, bytes):
-                stderr = stderr.decode(errors="replace")
-            stderr_info = f"; stderr={stderr.strip()}" if isinstance(stderr, str) and stderr.strip() else ""
-            logger.warning(
-                "Readability.js extraction failed with %s%s; falling back to pure-Python extraction",
-                type(exc).__name__,
-                stderr_info,
-                exc_info=True,
-            )
-            article = simple_json_from_html_string(html, use_readability=False)
+        article = None
+        if have_node():
+            try:
+                article = simple_json_from_html_string(html, use_readability=True)
+            except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+                stderr = getattr(exc, "stderr", None)
+                if isinstance(stderr, bytes):
+                    stderr = stderr.decode(errors="replace")
+                stderr_info = f"; stderr={stderr.strip()}" if isinstance(stderr, str) and stderr.strip() else ""
+                logger.warning(
+                    "Readability.js extraction failed with %s%s; falling back to pure-Python extraction",
+                    type(exc).__name__,
+                    stderr_info,
+                    exc_info=True,
+                )
+        if article is None:
+            # Readability.js cannot run here (no Node, or it just failed).
+            # Do not take readabilipy's pure-Python lane for the body: it
+            # strips every attribute except class/style, so link and image
+            # destinations are lost before Markdown conversion. Simplify the
+            # body here instead, keeping the destinations that
+            # _resolve_html_urls has already made absolute.
+            article = {
+                "title": extract_title(html),
+                "content": _simplified_body_html(html),
+            }
 
         html_content = article.get("content")
         if not html_content or not str(html_content).strip():
