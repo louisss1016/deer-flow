@@ -37,7 +37,20 @@ dotenv.main.find_dotenv = lambda *args, **kwargs: {str(default)!r}
 {ENTRYPOINTS[entrypoint]}
 print(json.dumps([os.getenv('ENV_FILE_TEST_VALUE'), os.getenv('ENV_FILE_TEST_DEFAULT_ONLY')]))
 """
-    return subprocess.run([sys.executable, "-c", script], cwd=cwd, env=env, capture_output=True, text=True, timeout=30)
+    # The child inherits no encoding settings, so on Windows it writes stderr
+    # in the ANSI code page (e.g. the "⚠"/"—" warning bytes are not UTF-8)
+    # while the parent may decode as UTF-8. Decode leniently so a foreign
+    # byte cannot kill the reader thread and blank out stderr entirely.
+    return subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=cwd,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
 
 
 @pytest.mark.parametrize("entrypoint", ENTRYPOINTS)
