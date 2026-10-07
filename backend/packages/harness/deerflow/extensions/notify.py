@@ -137,9 +137,18 @@ async def _notify_each(
                     timeout,
                 )
                 continue
-            await asyncio.wait_for(call, remaining)
-        except TimeoutError:
-            if deadline is not None and loop.time() >= deadline:
+            # Classify a spent budget without re-reading the clock: the
+            # deadline re-check is racy on coarse-clock platforms (Windows'
+            # event loop runs at ~15.6ms granularity against budgets as small
+            # as 20ms), which used to file an exhausted budget as a hook
+            # failure there. asyncio.wait() leaves the task pending only when
+            # OUR budget expires; a contributor that returned or raised on its
+            # own leaves it done.
+            call_task = asyncio.ensure_future(call)
+            done, _pending = await asyncio.wait({call_task}, timeout=remaining)
+            if not done:
+                call_task.cancel()
+                await asyncio.gather(call_task, return_exceptions=True)
                 # Budget exhaustion mid-hook is the same expected operational
                 # condition as the skip above, so it stays a warning rather
                 # than a hook failure with an asyncio-internal traceback.
@@ -150,15 +159,17 @@ async def _notify_each(
                     task_id,
                     timeout,
                 )
-            else:
-                # A TimeoutError the contributor raised on its own is a hook
-                # failure like any other.
-                logger.exception(
-                    "Extension %s: %s failed for task %s",
-                    source,
-                    hook,
-                    task_id,
-                )
+                continue
+            call_task.result()
+        except TimeoutError:
+            # A TimeoutError the contributor raised on its own is a hook
+            # failure like any other.
+            logger.exception(
+                "Extension %s: %s failed for task %s",
+                source,
+                hook,
+                task_id,
+            )
         except asyncio.CancelledError:
             if _host_is_cancelling():
                 raise
