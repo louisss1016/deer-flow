@@ -1,0 +1,50 @@
+name: backend-cross-os-offline-tests
+
+# Cross-OS run of the offline backend unit-test suite. Upstream CI only runs
+# ubuntu-latest (service containers make a full matrix impractical), so
+# Windows-specific failures are invisible upstream. This workflow runs the
+# same offline selection on both OSes so failures can be diffed:
+#   fail on BOTH  -> pre-existing / platform-independent
+#   fail on WINDOWS only -> Windows compatibility bug (contribution target)
+#
+# No service containers (unsupported on windows-latest anyway); DB-backed and
+# integration tests skip themselves when TEST_POSTGRES_URI is unset.
+
+on:
+  push:
+    branches: [ci/cross-os-tests]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        shard: [1, 2, 3, 4]
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          # Must match backend/Dockerfile's UV_IMAGE tag; pinned by backend/tests/test_ci_uv_version_pin.py
+          version: "0.11.1"
+
+      - name: Install backend dependencies (no postgres extra)
+        run: uv sync --group dev
+
+      - name: Run offline unit tests (shard ${{ matrix.shard }}/4)
+        env:
+          PYTHONPATH: .
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
+        run: uv run pytest -m "not live" --ignore=tests/blocking_io --splits 4 --group ${{ matrix.shard }} --splitting-algorithm least_duration --durations-path=.test_durations tests/ -q --tb=line
