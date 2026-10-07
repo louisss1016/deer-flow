@@ -117,6 +117,7 @@ async def _notify_each(
     """Invoke contributors in order, fail-open, within one shared budget."""
     loop = asyncio.get_running_loop()
     deadline = None if timeout is None else loop.time() + timeout
+    budget_spent = False
     for source, contributor in contributors:
         try:
             call = invoke(contributor)
@@ -124,8 +125,22 @@ async def _notify_each(
                 await call
                 continue
 
-            remaining = deadline - loop.time()
-            if remaining <= 0:
+            if budget_spent:
+                skip = True
+            else:
+                remaining = deadline - loop.time()
+                skip = remaining <= 0
+                if skip:
+                    # The budget ran out between contributors. Deciding that
+                    # by re-reading the clock at every successor is what kept
+                    # calling them on coarse-clock platforms (Windows' event
+                    # loop ticks at ~15.6ms against budgets as small as 20ms,
+                    # so the clock can still report a positive remainder
+                    # after the budget has actually been spent). Exhaustion
+                    # is remembered instead — once the budget is gone, every
+                    # later contributor is skipped deterministically.
+                    budget_spent = True
+            if skip:
                 close = getattr(call, "close", None)
                 if callable(close):
                     close()
@@ -151,7 +166,9 @@ async def _notify_each(
                 await asyncio.gather(call_task, return_exceptions=True)
                 # Budget exhaustion mid-hook is the same expected operational
                 # condition as the skip above, so it stays a warning rather
-                # than a hook failure with an asyncio-internal traceback.
+                # than a hook failure with an asyncio-internal traceback — and
+                # the spent budget is recorded for the successors below.
+                budget_spent = True
                 logger.warning(
                     "Extension %s: %s timed out for task %s; the %.1fs notification budget was spent",
                     source,
