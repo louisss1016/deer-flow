@@ -471,9 +471,7 @@ async def test_scheduled_cleanup_barrier_keeps_lease_renewal_and_remote_cancel_a
     original_deadline = record.lease_expires_at
     await store.request_cancel(record.run_id, action="rollback")
     await manager._renew_leases()
-    # >= not >: on Windows the system clock is coarse enough that a renewal
-    # within the same tick lands on the original deadline.
-    assert record.lease_expires_at >= original_deadline
+    assert record.lease_expires_at > original_deadline
     assert record.abort_event.is_set()
     assert record.abort_action == "rollback"
     assert (await store.get(record.run_id, user_id="alice"))["status"] == "pending"

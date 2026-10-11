@@ -1179,5 +1179,4 @@ class TestMainConfigResolution:
         else:
             assert exit_code == 1
             assert "✗ config.yaml found" in output
-            # Path() renders "~/cfg.yaml" on POSIX but "~\cfg.yaml" on Windows.
-            assert "~/cfg.yaml" in output.replace("\\", "/")
+            assert "~/cfg.yaml" in output

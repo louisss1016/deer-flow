@@ -71,9 +71,7 @@ def test_read_file_tool_keeps_custom_mount_path_provider_owned(tmp_path, monkeyp
     runtime = _local_runtime(tmp_path)
     mounted = tmp_path / "mounted-code"
     mounted.mkdir()
-    # write_bytes, not write_text: the latter translates "\n" to os.linesep on
-    # Windows, while read_file deliberately returns stored line endings.
-    (mounted / "notes.txt").write_bytes(b"first\nsecond\nthird")
+    (mounted / "notes.txt").write_text("first\nsecond\nthird", encoding="utf-8")
     sandbox = LocalSandbox(
         "local:t1",
         path_mappings=[PathMapping(container_path="/mnt/code-read", local_path=str(mounted), read_only=True)],

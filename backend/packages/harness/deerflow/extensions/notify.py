@@ -117,7 +117,6 @@ async def _notify_each(
     """Invoke contributors in order, fail-open, within one shared budget."""
     loop = asyncio.get_running_loop()
     deadline = None if timeout is None else loop.time() + timeout
-    budget_spent = False
     for source, contributor in contributors:
         try:
             call = invoke(contributor)
@@ -125,22 +124,8 @@ async def _notify_each(
                 await call
                 continue
 
-            if budget_spent:
-                skip = True
-            else:
-                remaining = deadline - loop.time()
-                skip = remaining <= 0
-                if skip:
-                    # The budget ran out between contributors. Deciding that
-                    # by re-reading the clock at every successor is what kept
-                    # calling them on coarse-clock platforms (Windows' event
-                    # loop ticks at ~15.6ms against budgets as small as 20ms,
-                    # so the clock can still report a positive remainder
-                    # after the budget has actually been spent). Exhaustion
-                    # is remembered instead — once the budget is gone, every
-                    # later contributor is skipped deterministically.
-                    budget_spent = True
-            if skip:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
                 close = getattr(call, "close", None)
                 if callable(close):
                     close()
@@ -152,23 +137,12 @@ async def _notify_each(
                     timeout,
                 )
                 continue
-            # Classify a spent budget without re-reading the clock: the
-            # deadline re-check is racy on coarse-clock platforms (Windows'
-            # event loop runs at ~15.6ms granularity against budgets as small
-            # as 20ms), which used to file an exhausted budget as a hook
-            # failure there. asyncio.wait() leaves the task pending only when
-            # OUR budget expires; a contributor that returned or raised on its
-            # own leaves it done.
-            call_task = asyncio.ensure_future(call)
-            done, _pending = await asyncio.wait({call_task}, timeout=remaining)
-            if not done:
-                call_task.cancel()
-                await asyncio.gather(call_task, return_exceptions=True)
+            await asyncio.wait_for(call, remaining)
+        except TimeoutError:
+            if deadline is not None and loop.time() >= deadline:
                 # Budget exhaustion mid-hook is the same expected operational
                 # condition as the skip above, so it stays a warning rather
-                # than a hook failure with an asyncio-internal traceback — and
-                # the spent budget is recorded for the successors below.
-                budget_spent = True
+                # than a hook failure with an asyncio-internal traceback.
                 logger.warning(
                     "Extension %s: %s timed out for task %s; the %.1fs notification budget was spent",
                     source,
@@ -176,17 +150,15 @@ async def _notify_each(
                     task_id,
                     timeout,
                 )
-                continue
-            call_task.result()
-        except TimeoutError:
-            # A TimeoutError the contributor raised on its own is a hook
-            # failure like any other.
-            logger.exception(
-                "Extension %s: %s failed for task %s",
-                source,
-                hook,
-                task_id,
-            )
+            else:
+                # A TimeoutError the contributor raised on its own is a hook
+                # failure like any other.
+                logger.exception(
+                    "Extension %s: %s failed for task %s",
+                    source,
+                    hook,
+                    task_id,
+                )
         except asyncio.CancelledError:
             if _host_is_cancelling():
                 raise
