@@ -53,6 +53,12 @@ HEARTBEAT_SENTINEL = StreamEvent(id="", event="__heartbeat__", data=None)
 END_SENTINEL = StreamEvent(id="", event="__end__", data=None)
 type StreamItem = StreamEvent | StreamGap
 
+# Readiness vocabulary for :meth:`StreamBridge.health_check`. Values match the
+# gateway's database probe vocabulary so readiness payloads stay uniform.
+HEALTH_OK = "ok"
+HEALTH_NOT_CONFIGURED = "not_configured"
+HEALTH_UNREACHABLE = "unreachable"
+
 
 class StreamBridge(abc.ABC):
     """Abstract base for stream bridges."""
@@ -111,17 +117,18 @@ class StreamBridge(abc.ABC):
         giving late subscribers a chance to drain remaining events.
         """
 
-    async def ping(self) -> bool:
-        """Return whether the bridge's external backend is reachable right now.
-
-        Used by the gateway readiness probe. The default is for bridges with
-        no external backend: the in-process memory bridge has nothing to
-        probe and is always reachable. A bridge that sets
-        :attr:`supports_cross_process` talks to a shared backend and should
-        override this with a bounded round trip, answering ``False`` (not
-        raising) when the backend is down.
-        """
-        return True
-
     async def close(self) -> None:
         """Release backend resources.  Default is a no-op."""
+
+    async def health_check(self) -> str:
+        """Report the bridge's backend health for readiness probes.
+
+        Returns one of :data:`HEALTH_OK`, :data:`HEALTH_NOT_CONFIGURED`,
+        :data:`HEALTH_UNREACHABLE`.  The default implementation reports
+        ``not_configured``: an in-process bridge (e.g. memory) has no
+        external dependency to probe.  Bridges backed by an external service
+        override this to probe that service within a bounded budget, so the
+        gateway's ``/health/ready`` can fail closed while the service behind
+        the bridge is unreachable.
+        """
+        return HEALTH_NOT_CONFIGURED

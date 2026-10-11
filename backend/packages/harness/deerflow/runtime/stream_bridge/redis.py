@@ -27,9 +27,23 @@ except ImportError:  # pragma: no cover - only hit when the optional extra is mi
         "Or switch to stream_bridge.type: memory in config.yaml for single-process deployment."
     ) from None
 
-from .base import DEFAULT_HEARTBEAT_INTERVAL_SECONDS, END_SENTINEL, HEARTBEAT_SENTINEL, StreamBridge, StreamEvent, StreamGap, StreamItem
+from .base import (
+    DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
+    END_SENTINEL,
+    HEALTH_OK,
+    HEALTH_UNREACHABLE,
+    HEARTBEAT_SENTINEL,
+    StreamBridge,
+    StreamEvent,
+    StreamGap,
+    StreamItem,
+)
 
 logger = logging.getLogger(__name__)
+
+# Budget for the readiness ping. Matches the gateway probe timeout so a
+# wedged Redis cannot hold a readiness request beyond one probe window.
+_HEALTH_PING_TIMEOUT_SECONDS = 2.0
 
 _KIND_EVENT = "event"
 _KIND_END = "end"
@@ -190,20 +204,6 @@ class RedisStreamBridge(StreamBridge):
         """Return whether Redis still has retained stream data for *run_id*."""
         return bool(await self._redis.exists(self._stream_key(run_id)))
 
-    async def ping(self) -> bool:
-        """Round-trip ``PING`` to the Redis backend for the readiness probe.
-
-        The client connects lazily, so until something publishes nothing has
-        verified that Redis is reachable; this is the only call that does.
-        Redis-side failures answer ``False`` so the probe gets a verdict rather
-        than a stack of client internals. Callers bound the wait themselves.
-        """
-        try:
-            return bool(await self._redis.ping())
-        except RedisError:
-            logger.warning("Redis stream bridge ping failed", exc_info=True)
-            return False
-
     async def _resolve_start_stream_id(self, key: str, last_event_id: str | None) -> str:
         if last_event_id is None:
             return "0-0"
@@ -318,26 +318,6 @@ class RedisStreamBridge(StreamBridge):
                     )
                     return
 
-            # A syntactically valid but future Last-Event-ID cannot replay from
-            # this retained stream. In particular, an already-ended run would
-            # otherwise heartbeat forever because XREAD never sees its end marker.
-            if latest_entries and gap_detection_enabled:
-                latest_id = self._decode(latest_entries[0][0])
-                if self._stream_id_lt(latest_id, stream_id):
-                    earliest_id = self._decode(earliest_entries[0][0])
-                    logger.warning(
-                        "subscriber for Redis stream %s requested future cursor %s (latest %s)",
-                        key,
-                        stream_id,
-                        latest_id,
-                    )
-                    yield StreamGap(
-                        requested_event_id=stream_id,
-                        earliest_available_event_id=earliest_id,
-                        latest_available_event_id=latest_id,
-                    )
-                    return
-
             responses_to_process = []
             if pending_initial_response is not None:
                 responses_to_process.append(pending_initial_response)
@@ -416,3 +396,20 @@ class RedisStreamBridge(StreamBridge):
         result = close()
         if inspect.isawaitable(result):
             await result
+
+    async def health_check(self) -> str:
+        """Ping Redis within a bounded budget for the readiness probe.
+
+        The client is lazy: construction never connects, so without this a
+        gateway with an unreachable (or absent) Redis reports ready and keeps
+        receiving traffic until the first ``publish`` fails. A failure here
+        is reported as ``unreachable`` — the multi-instance gate (#6328)
+        makes this bridge mandatory, so readiness must fail closed.
+        """
+        try:
+            async with asyncio.timeout(_HEALTH_PING_TIMEOUT_SECONDS):
+                await self._redis.ping()
+        except Exception:
+            logger.warning("Readiness probe: Redis stream bridge ping failed", exc_info=True)
+            return HEALTH_UNREACHABLE
+        return HEALTH_OK

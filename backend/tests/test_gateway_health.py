@@ -4,31 +4,33 @@ import asyncio
 import pathlib
 import sqlite3
 import sys
+import threading
 import time
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
-import httpx
 import pytest
+import requests
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import app.gateway.health as health_module
 from app.gateway.health import (
-    PROBE_NOT_CONFIGURED,
-    PROBE_OK,
-    PROBE_UNREACHABLE,
-    READINESS_CHECKPOINTER_CONFIG_ATTR,
-    READINESS_PROVISIONER_URL_ATTR,
+    DATABASE_NOT_CONFIGURED,
+    DATABASE_OK,
+    DATABASE_UNREACHABLE,
+    HEALTH_NOT_CONFIGURED,
+    HEALTH_OK,
+    HEALTH_UNREACHABLE,
     _probe_checkpointer_backend,
-    _probe_provisioner,
-    _probe_stream_bridge,
     check_database_health,
+    check_provisioner_health,
+    check_stream_bridge_health,
     readiness_payload,
+    register_readiness_route,
     resolve_checkpointer_config,
-    resolve_provisioner_url,
 )
 from deerflow.config.checkpointer_config import CheckpointerConfig
-from deerflow.runtime import MemoryStreamBridge
 
 
 class _FakeConnection:
@@ -56,84 +58,50 @@ def _create_sqlite_file(path: pathlib.Path) -> None:
     sqlite3.connect(str(path)).close()
 
 
-class _FakeCrossProcessBridge(MemoryStreamBridge):
-    """Bridge with an external backend whose ``ping`` answer is scripted."""
-
-    supports_cross_process = True
-
-    def __init__(self, *, result: bool = True, error: Exception | None = None, delay: float = 0.0) -> None:
-        super().__init__()
-        self._result = result
-        self._error = error
-        self._delay = delay
-        self.ping_calls = 0
-
-    async def ping(self) -> bool:
-        self.ping_calls += 1
-        if self._delay:
-            await asyncio.sleep(self._delay)
-        if self._error is not None:
-            raise self._error
-        return self._result
-
-
-def _provisioner_client_factory(handler):
-    """Return a ``_make_provisioner_client`` replacement backed by ``httpx.MockTransport``."""
-
-    def _factory(provisioner_url: str) -> httpx.AsyncClient:
-        return httpx.AsyncClient(transport=httpx.MockTransport(handler))
-
-    return _factory
-
-
-def _install_provisioner(monkeypatch, handler) -> None:
-    monkeypatch.setattr(health_module, "_make_provisioner_client", _provisioner_client_factory(handler))
-
-
 @pytest.mark.anyio
 async def test_check_database_health_without_engine(monkeypatch):
     """backend=memory (no engine) must report not_configured, never unreachable."""
     monkeypatch.setattr("app.gateway.health.get_engine", lambda: None)
 
-    assert await check_database_health() == PROBE_NOT_CONFIGURED
+    assert await check_database_health() == DATABASE_NOT_CONFIGURED
 
 
 @pytest.mark.anyio
 async def test_check_database_health_reachable(monkeypatch):
     monkeypatch.setattr("app.gateway.health.get_engine", lambda: _FakeEngine())
 
-    assert await check_database_health() == PROBE_OK
+    assert await check_database_health() == DATABASE_OK
 
 
 @pytest.mark.anyio
 async def test_check_database_health_unreachable(monkeypatch):
     monkeypatch.setattr("app.gateway.health.get_engine", lambda: _FakeEngine(unreachable=True))
 
-    assert await check_database_health() == PROBE_UNREACHABLE
+    assert await check_database_health() == DATABASE_UNREACHABLE
 
 
 @pytest.mark.anyio
 async def test_readiness_payload_ready_when_database_ok_and_memory_backend(monkeypatch):
     monkeypatch.setattr("app.gateway.health.get_engine", lambda: _FakeEngine())
 
-    status_code, payload = await readiness_payload(CheckpointerConfig(type="memory"), stream_bridge=MemoryStreamBridge())
+    status_code, payload = await readiness_payload(CheckpointerConfig(type="memory"))
 
     assert status_code == 200
     assert payload["status"] == "ready"
-    assert payload["database"] == PROBE_OK
-    assert payload["checkpointer"] == PROBE_NOT_CONFIGURED
+    assert payload["database"] == DATABASE_OK
+    assert payload["checkpointer"] == DATABASE_NOT_CONFIGURED
 
 
 @pytest.mark.anyio
 async def test_readiness_payload_degraded_when_database_unreachable(monkeypatch):
     monkeypatch.setattr("app.gateway.health.get_engine", lambda: _FakeEngine(unreachable=True))
 
-    status_code, payload = await readiness_payload(CheckpointerConfig(type="memory"), stream_bridge=MemoryStreamBridge())
+    status_code, payload = await readiness_payload(CheckpointerConfig(type="memory"))
 
     assert status_code == 503
     assert payload["status"] == "degraded"
-    assert payload["database"] == PROBE_UNREACHABLE
-    assert payload["checkpointer"] == PROBE_NOT_CONFIGURED
+    assert payload["database"] == DATABASE_UNREACHABLE
+    assert payload["checkpointer"] == DATABASE_NOT_CONFIGURED
 
 
 @pytest.mark.anyio
@@ -141,12 +109,12 @@ async def test_readiness_payload_ready_when_nothing_configured(monkeypatch):
     """backend=memory end to end must stay ready with not_configured results."""
     monkeypatch.setattr("app.gateway.health.get_engine", lambda: None)
 
-    status_code, payload = await readiness_payload(CheckpointerConfig(type="memory"), stream_bridge=MemoryStreamBridge())
+    status_code, payload = await readiness_payload(CheckpointerConfig(type="memory"))
 
     assert status_code == 200
     assert payload["status"] == "ready"
-    assert payload["database"] == PROBE_NOT_CONFIGURED
-    assert payload["checkpointer"] == PROBE_NOT_CONFIGURED
+    assert payload["database"] == DATABASE_NOT_CONFIGURED
+    assert payload["checkpointer"] == DATABASE_NOT_CONFIGURED
 
 
 @pytest.mark.anyio
@@ -155,12 +123,12 @@ async def test_readiness_payload_degraded_when_checkpointer_unreachable_but_data
     monkeypatch.setattr("app.gateway.health.get_engine", lambda: _FakeEngine())
     config = CheckpointerConfig(type="sqlite", connection_string=str(tmp_path / "missing" / "checkpoints.db"))
 
-    status_code, payload = await readiness_payload(config, stream_bridge=MemoryStreamBridge())
+    status_code, payload = await readiness_payload(config)
 
     assert status_code == 503
     assert payload["status"] == "degraded"
-    assert payload["database"] == PROBE_OK
-    assert payload["checkpointer"] == PROBE_UNREACHABLE
+    assert payload["database"] == DATABASE_OK
+    assert payload["checkpointer"] == DATABASE_UNREACHABLE
 
 
 @pytest.mark.anyio
@@ -168,12 +136,12 @@ async def test_readiness_payload_fails_closed_without_startup_snapshot(monkeypat
     """No startup config snapshot must degrade readiness, never report ready."""
     monkeypatch.setattr("app.gateway.health.get_engine", lambda: _FakeEngine())
 
-    status_code, payload = await readiness_payload(None, stream_bridge=MemoryStreamBridge())
+    status_code, payload = await readiness_payload(None)
 
     assert status_code == 503
     assert payload["status"] == "degraded"
-    assert payload["database"] == PROBE_OK
-    assert payload["checkpointer"] == PROBE_UNREACHABLE
+    assert payload["database"] == DATABASE_OK
+    assert payload["checkpointer"] == DATABASE_UNREACHABLE
 
 
 @pytest.mark.anyio
@@ -182,26 +150,19 @@ async def test_readiness_probes_run_concurrently(monkeypatch):
 
     async def _slow_ok(*args) -> str:
         await asyncio.sleep(0.35)
-        return PROBE_OK
+        return DATABASE_OK
 
     monkeypatch.setattr(health_module, "check_database_health", _slow_ok)
     monkeypatch.setattr(health_module, "_probe_checkpointer_backend", _slow_ok)
-    monkeypatch.setattr(health_module, "_probe_provisioner", _slow_ok)
 
     started = time.perf_counter()
-    status_code, payload = await readiness_payload(
-        CheckpointerConfig(type="memory"),
-        stream_bridge=_FakeCrossProcessBridge(delay=0.35),
-        provisioner_url="http://provisioner:8002",
-    )
+    status_code, payload = await readiness_payload(CheckpointerConfig(type="memory"))
     elapsed = time.perf_counter() - started
 
     assert status_code == 200
-    assert payload["database"] == PROBE_OK
-    assert payload["checkpointer"] == PROBE_OK
-    assert payload["stream_bridge"] == PROBE_OK
-    assert payload["provisioner"] == PROBE_OK
-    # Four sequential 0.35s probes would take ~1.4s; concurrent ones finish
+    assert payload["database"] == DATABASE_OK
+    assert payload["checkpointer"] == DATABASE_OK
+    # Two sequential 0.35s probes would take ~0.7s; concurrent ones finish
     # within a single probe window.
     assert elapsed < 0.6
 
@@ -212,18 +173,18 @@ async def test_readiness_payload_enforces_endpoint_deadline(monkeypatch):
 
     async def _hanging(*args) -> str:
         await asyncio.sleep(30)
-        return PROBE_OK
+        return DATABASE_OK
 
     monkeypatch.setattr(health_module, "check_database_health", _hanging)
     monkeypatch.setattr(health_module, "_probe_checkpointer_backend", _hanging)
     monkeypatch.setattr(health_module, "_READINESS_DEADLINE_SECONDS", 0.05)
 
-    status_code, payload = await readiness_payload(CheckpointerConfig(type="memory"), stream_bridge=MemoryStreamBridge())
+    status_code, payload = await readiness_payload(CheckpointerConfig(type="memory"))
 
     assert status_code == 503
     assert payload["status"] == "degraded"
-    assert payload["database"] == PROBE_UNREACHABLE
-    assert payload["checkpointer"] == PROBE_UNREACHABLE
+    assert payload["database"] == DATABASE_UNREACHABLE
+    assert payload["checkpointer"] == DATABASE_UNREACHABLE
 
 
 @pytest.mark.anyio
@@ -244,7 +205,7 @@ async def test_concurrent_readiness_requests_do_not_open_concurrent_probe_connec
         max_active = max(max_active, active)
         try:
             await asyncio.sleep(0.05)
-            return PROBE_OK
+            return DATABASE_OK
         finally:
             active -= 1
 
@@ -252,7 +213,7 @@ async def test_concurrent_readiness_requests_do_not_open_concurrent_probe_connec
     monkeypatch.setattr("app.gateway.health.get_engine", lambda: None)
     config = CheckpointerConfig(type="sqlite", connection_string=":memory:")
 
-    results = await asyncio.gather(*(readiness_payload(config, stream_bridge=MemoryStreamBridge()) for _ in range(8)))
+    results = await asyncio.gather(*(readiness_payload(config) for _ in range(8)))
 
     assert [status_code for status_code, _ in results] == [200] * 8
     assert max_active == 1
@@ -260,7 +221,7 @@ async def test_concurrent_readiness_requests_do_not_open_concurrent_probe_connec
 
 @pytest.mark.anyio
 async def test_probe_checkpointer_memory_reports_not_configured():
-    assert await _probe_checkpointer_backend(CheckpointerConfig(type="memory")) == PROBE_NOT_CONFIGURED
+    assert await _probe_checkpointer_backend(CheckpointerConfig(type="memory")) == DATABASE_NOT_CONFIGURED
 
 
 @pytest.mark.anyio
@@ -270,7 +231,7 @@ async def test_probe_checkpointer_sqlite_reachable(tmp_path):
 
     result = await _probe_checkpointer_backend(CheckpointerConfig(type="sqlite", connection_string=str(db_path)))
 
-    assert result == PROBE_OK
+    assert result == DATABASE_OK
 
 
 @pytest.mark.anyio
@@ -285,7 +246,7 @@ async def test_probe_checkpointer_sqlite_uri_is_unreachable(conn_string, tmp_pat
 
     result = await _probe_checkpointer_backend(CheckpointerConfig(type="sqlite", connection_string=conn_string))
 
-    assert result == PROBE_UNREACHABLE
+    assert result == DATABASE_UNREACHABLE
     assert [path.name for path in tmp_path.iterdir()] == ["checkpoints.db"]
 
 
@@ -296,7 +257,7 @@ async def test_probe_checkpointer_sqlite_missing_file_stays_missing_and_unreacha
 
     result = await _probe_checkpointer_backend(CheckpointerConfig(type="sqlite", connection_string=str(missing)))
 
-    assert result == PROBE_UNREACHABLE
+    assert result == DATABASE_UNREACHABLE
     assert not missing.exists()
 
 
@@ -306,7 +267,7 @@ async def test_probe_checkpointer_sqlite_unreachable_when_parent_missing(tmp_pat
 
     result = await _probe_checkpointer_backend(CheckpointerConfig(type="sqlite", connection_string=str(missing_parent)))
 
-    assert result == PROBE_UNREACHABLE
+    assert result == DATABASE_UNREACHABLE
 
 
 @pytest.mark.anyio
@@ -314,7 +275,7 @@ async def test_probe_checkpointer_sqlite_in_memory_is_not_configured():
     """In-memory SQLite has no external state, mirroring the memory backend."""
     result = await _probe_checkpointer_backend(CheckpointerConfig(type="sqlite", connection_string=":memory:"))
 
-    assert result == PROBE_NOT_CONFIGURED
+    assert result == DATABASE_NOT_CONFIGURED
 
 
 @pytest.mark.anyio
@@ -328,7 +289,7 @@ async def test_probe_checkpointer_postgres_without_psycopg_is_unreachable(monkey
         )
     )
 
-    assert result == PROBE_UNREACHABLE
+    assert result == DATABASE_UNREACHABLE
 
 
 def test_resolve_checkpointer_config_passes_through_resolution(monkeypatch):
@@ -451,387 +412,208 @@ async def test_postgres_probe_drains_connection_close_across_repeated_cancellati
     )
 
 
-# ---------------------------------------------------------------------------
-# Stream bridge probe
-# ---------------------------------------------------------------------------
+class _FakeResponse:
+    def __init__(self, status_code: int):
+        self.status_code = status_code
+
+
+class _FakeBridge:
+    """Minimal StreamBridge stand-in for readiness-probe tests."""
+
+    def __init__(self, result: str | None = None, *, raises: bool = False):
+        self._result = result
+        self._raises = raises
+        self.calls = 0
+
+    async def health_check(self) -> str:
+        self.calls += 1
+        if self._raises:
+            raise RuntimeError("bridge health check exploded")
+        return self._result
 
 
 @pytest.mark.anyio
-async def test_probe_stream_bridge_memory_reports_not_configured():
-    """The process-local memory bridge has no external backend to probe."""
-    bridge = MemoryStreamBridge()
-
-    assert await _probe_stream_bridge(bridge) == PROBE_NOT_CONFIGURED
+async def test_check_stream_bridge_health_none_is_not_configured():
+    assert await check_stream_bridge_health(None) == HEALTH_NOT_CONFIGURED
 
 
 @pytest.mark.anyio
-async def test_probe_stream_bridge_reachable_backend_is_ok():
-    bridge = _FakeCrossProcessBridge(result=True)
-
-    assert await _probe_stream_bridge(bridge) == PROBE_OK
-    assert bridge.ping_calls == 1
+async def test_check_stream_bridge_health_ok():
+    assert await check_stream_bridge_health(_FakeBridge(HEALTH_OK)) == HEALTH_OK
 
 
 @pytest.mark.anyio
-async def test_probe_stream_bridge_false_ping_is_unreachable():
-    assert await _probe_stream_bridge(_FakeCrossProcessBridge(result=False)) == PROBE_UNREACHABLE
+async def test_check_stream_bridge_health_unreachable():
+    assert await check_stream_bridge_health(_FakeBridge(HEALTH_UNREACHABLE)) == HEALTH_UNREACHABLE
 
 
 @pytest.mark.anyio
-async def test_probe_stream_bridge_raising_ping_is_unreachable():
-    assert await _probe_stream_bridge(_FakeCrossProcessBridge(error=RuntimeError("redis exploded"))) == PROBE_UNREACHABLE
+async def test_check_stream_bridge_health_raising_bridge_fails_closed():
+    """A custom bridge raising must degrade readiness, never 500 the route."""
+    assert await check_stream_bridge_health(_FakeBridge(raises=True)) == HEALTH_UNREACHABLE
 
 
 @pytest.mark.anyio
-async def test_probe_stream_bridge_enforces_probe_timeout(monkeypatch):
-    """A ping that never answers must be bounded by the per-probe budget."""
-    monkeypatch.setattr(health_module, "_PROBE_TIMEOUT_SECONDS", 0.05)
-
-    started = time.perf_counter()
-    result = await _probe_stream_bridge(_FakeCrossProcessBridge(delay=30))
-    elapsed = time.perf_counter() - started
-
-    assert result == PROBE_UNREACHABLE
-    assert elapsed < 1.0
+async def test_check_provisioner_health_empty_url_is_not_configured():
+    assert await check_provisioner_health("") == HEALTH_NOT_CONFIGURED
 
 
 @pytest.mark.anyio
-async def test_probe_stream_bridge_fails_closed_without_bridge():
-    """No bridge on app.state means runs cannot stream: never report ready."""
-    assert await _probe_stream_bridge(None) == PROBE_UNREACHABLE
+async def test_check_provisioner_health_ok(monkeypatch):
+    monkeypatch.setattr(requests, "get", lambda url, timeout=None: _FakeResponse(200))
+
+    assert await check_provisioner_health("http://provisioner:8002/") == HEALTH_OK
 
 
 @pytest.mark.anyio
-async def test_concurrent_stream_bridge_probes_are_serialized():
-    """Public /health/ready must not fan a thundering herd out onto the Redis pool."""
-    active = 0
-    max_active = 0
+async def test_check_provisioner_health_non_200_is_unreachable(monkeypatch):
+    monkeypatch.setattr(requests, "get", lambda url, timeout=None: _FakeResponse(500))
 
-    class _TrackingBridge(_FakeCrossProcessBridge):
-        async def ping(self) -> bool:
-            nonlocal active, max_active
-            active += 1
-            max_active = max(max_active, active)
-            try:
-                await asyncio.sleep(0.02)
-                return True
-            finally:
-                active -= 1
-
-    bridge = _TrackingBridge()
-    results = await asyncio.gather(*(_probe_stream_bridge(bridge) for _ in range(6)))
-
-    assert results == [PROBE_OK] * 6
-    assert max_active == 1
-
-
-# ---------------------------------------------------------------------------
-# Provisioner probe
-# ---------------------------------------------------------------------------
-
-
-def test_resolve_provisioner_url_normalises_configured_url():
-    config = SimpleNamespace(sandbox=SimpleNamespace(provisioner_url=" http://provisioner:8002/ "))
-
-    assert resolve_provisioner_url(config) == "http://provisioner:8002"
-
-
-@pytest.mark.parametrize(
-    "config",
-    [
-        SimpleNamespace(sandbox=SimpleNamespace()),
-        SimpleNamespace(sandbox=SimpleNamespace(provisioner_url=None)),
-        SimpleNamespace(sandbox=SimpleNamespace(provisioner_url="   ")),
-        SimpleNamespace(sandbox=None),
-        SimpleNamespace(),
-    ],
-    ids=["no-field", "none", "blank", "no-sandbox", "no-sandbox-attr"],
-)
-def test_resolve_provisioner_url_absent(config):
-    assert resolve_provisioner_url(config) is None
+    assert await check_provisioner_health("http://provisioner:8002") == HEALTH_UNREACHABLE
 
 
 @pytest.mark.anyio
-async def test_probe_provisioner_not_configured_without_url():
-    assert await _probe_provisioner(None) == PROBE_NOT_CONFIGURED
+async def test_check_provisioner_health_transport_error_is_unreachable(monkeypatch):
+    def _boom(url, timeout=None):
+        raise requests.ConnectionError("connection refused")
+
+    monkeypatch.setattr(requests, "get", _boom)
+
+    assert await check_provisioner_health("http://provisioner:8002") == HEALTH_UNREACHABLE
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize(
-    ("provisioner_url", "trust_env"),
-    [
-        ("http://provisioner:8002", False),
-        ("http://10.1.2.3:8002", False),
-        ("http://127.0.0.1:8002", False),
-        ("http://provisioner.docker.internal:8002", False),
-        ("https://provisioner.example.com", True),
-        ("http://8.8.8.8:8002", True),
-    ],
-    ids=["service-name", "private-ip", "loopback", "docker-internal", "external-fqdn", "public-ip"],
-)
-async def test_make_provisioner_client_bypasses_proxy_for_control_plane_addresses(provisioner_url, trust_env):
-    """Control-plane targets must not be routed through HTTP_PROXY.
+async def test_check_provisioner_health_runs_off_event_loop_thread(monkeypatch):
+    """The synchronous provisioner GET must never block the event loop."""
+    loop_thread = threading.get_ident()
 
-    httpx does not treat CIDR entries in NO_PROXY as subnet bypasses the way the
-    requests-based sandbox calls do, so the probe applies the same
-    target-aware policy those clients use instead of trusting the environment.
-    """
-    async with health_module._make_provisioner_client(provisioner_url) as client:
-        assert client.trust_env is trust_env
+    def fake_get(url, timeout=None):
+        assert threading.get_ident() != loop_thread
+        return _FakeResponse(200)
 
+    monkeypatch.setattr(requests, "get", fake_get)
 
-@pytest.mark.anyio
-async def test_probe_provisioner_calls_unauthenticated_health_route(monkeypatch):
-    """The probe targets the provisioner's own GET /health, which needs no API key."""
-    seen: list[httpx.Request] = []
-
-    def _handler(request: httpx.Request) -> httpx.Response:
-        seen.append(request)
-        return httpx.Response(200, json={"status": "ok"})
-
-    _install_provisioner(monkeypatch, _handler)
-
-    assert await _probe_provisioner("http://provisioner:8002") == PROBE_OK
-    assert [str(request.url) for request in seen] == ["http://provisioner:8002/health"]
-    assert "x-api-key" not in {name.lower() for name in seen[0].headers}
-
-
-@pytest.mark.anyio
-async def test_probe_provisioner_non_200_is_unreachable(monkeypatch):
-    _install_provisioner(monkeypatch, lambda request: httpx.Response(503, text="draining"))
-
-    assert await _probe_provisioner("http://provisioner:8002") == PROBE_UNREACHABLE
-
-
-@pytest.mark.anyio
-async def test_probe_provisioner_connection_error_is_unreachable(monkeypatch):
-    def _handler(request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("connection refused", request=request)
-
-    _install_provisioner(monkeypatch, _handler)
-
-    assert await _probe_provisioner("http://provisioner:8002") == PROBE_UNREACHABLE
-
-
-@pytest.mark.anyio
-async def test_probe_provisioner_enforces_probe_timeout(monkeypatch):
-    monkeypatch.setattr(health_module, "_PROBE_TIMEOUT_SECONDS", 0.05)
-
-    async def _hanging_handler(request: httpx.Request) -> httpx.Response:
-        await asyncio.sleep(30)
-        return httpx.Response(200)
-
-    _install_provisioner(monkeypatch, _hanging_handler)
-
-    started = time.perf_counter()
-    result = await _probe_provisioner("http://provisioner:8002")
-    elapsed = time.perf_counter() - started
-
-    assert result == PROBE_UNREACHABLE
-    assert elapsed < 1.0
-
-
-@pytest.mark.anyio
-async def test_concurrent_provisioner_probes_are_serialized(monkeypatch):
-    """Public /health/ready must not amplify into a connection flood at the provisioner."""
-    active = 0
-    max_active = 0
-
-    async def _handler(request: httpx.Request) -> httpx.Response:
-        nonlocal active, max_active
-        active += 1
-        max_active = max(max_active, active)
-        try:
-            await asyncio.sleep(0.02)
-            return httpx.Response(200)
-        finally:
-            active -= 1
-
-    _install_provisioner(monkeypatch, _handler)
-
-    results = await asyncio.gather(*(_probe_provisioner("http://provisioner:8002") for _ in range(6)))
-
-    assert results == [PROBE_OK] * 6
-    assert max_active == 1
-
-
-# ---------------------------------------------------------------------------
-# readiness_payload: stream bridge and provisioner verdicts
-# ---------------------------------------------------------------------------
+    assert await check_provisioner_health("http://provisioner:8002") == HEALTH_OK
 
 
 @pytest.mark.anyio
 async def test_readiness_payload_degraded_when_stream_bridge_unreachable(monkeypatch):
-    """Redis down means no run can publish, stream or be cancelled: the pod is not ready."""
     monkeypatch.setattr("app.gateway.health.get_engine", lambda: _FakeEngine())
 
-    status_code, payload = await readiness_payload(CheckpointerConfig(type="memory"), stream_bridge=_FakeCrossProcessBridge(result=False))
+    status_code, payload = await readiness_payload(CheckpointerConfig(type="memory"), _FakeBridge(HEALTH_UNREACHABLE))
 
     assert status_code == 503
     assert payload["status"] == "degraded"
-    assert payload["database"] == PROBE_OK
-    assert payload["checkpointer"] == PROBE_NOT_CONFIGURED
-    assert payload["stream_bridge"] == PROBE_UNREACHABLE
-    assert payload["provisioner"] == PROBE_NOT_CONFIGURED
+    assert payload["database"] == DATABASE_OK
+    assert payload["checkpointer"] == DATABASE_NOT_CONFIGURED
+    assert payload["stream_bridge"] == HEALTH_UNREACHABLE
 
 
 @pytest.mark.anyio
-async def test_readiness_payload_ready_when_stream_bridge_reachable(monkeypatch):
+async def test_readiness_payload_ready_with_memory_bridge(monkeypatch):
+    """An in-process bridge has no external dependency to probe."""
     monkeypatch.setattr("app.gateway.health.get_engine", lambda: _FakeEngine())
 
-    status_code, payload = await readiness_payload(CheckpointerConfig(type="memory"), stream_bridge=_FakeCrossProcessBridge(result=True))
+    status_code, payload = await readiness_payload(CheckpointerConfig(type="memory"), _FakeBridge(HEALTH_NOT_CONFIGURED))
 
     assert status_code == 200
     assert payload["status"] == "ready"
-    assert payload["stream_bridge"] == PROBE_OK
+    assert payload["stream_bridge"] == HEALTH_NOT_CONFIGURED
 
 
 @pytest.mark.anyio
-async def test_readiness_payload_fails_closed_without_stream_bridge(monkeypatch):
+async def test_readiness_payload_provisioner_reported_without_degrading(monkeypatch):
+    """A shared provisioner blip must be reported, never drain the service."""
     monkeypatch.setattr("app.gateway.health.get_engine", lambda: _FakeEngine())
-
-    status_code, payload = await readiness_payload(CheckpointerConfig(type="memory"), stream_bridge=None)
-
-    assert status_code == 503
-    assert payload["stream_bridge"] == PROBE_UNREACHABLE
-
-
-@pytest.mark.anyio
-async def test_readiness_payload_reports_unreachable_provisioner_without_degrading(monkeypatch):
-    """Every replica shares one provisioner; its blip must not take the whole service out."""
-    monkeypatch.setattr("app.gateway.health.get_engine", lambda: _FakeEngine())
-    _install_provisioner(monkeypatch, lambda request: httpx.Response(503))
+    monkeypatch.setattr(requests, "get", lambda url, timeout=None: _FakeResponse(503))
 
     status_code, payload = await readiness_payload(
         CheckpointerConfig(type="memory"),
-        stream_bridge=MemoryStreamBridge(),
-        provisioner_url="http://provisioner:8002",
+        _FakeBridge(HEALTH_OK),
+        "http://provisioner:8002",
     )
 
     assert status_code == 200
     assert payload["status"] == "ready"
-    assert payload["provisioner"] == PROBE_UNREACHABLE
+    assert payload["stream_bridge"] == HEALTH_OK
+    assert payload["provisioner"] == HEALTH_UNREACHABLE
 
 
 @pytest.mark.anyio
-async def test_readiness_payload_reports_reachable_provisioner(monkeypatch):
+async def test_readiness_payload_provisioner_ok_reported(monkeypatch):
     monkeypatch.setattr("app.gateway.health.get_engine", lambda: _FakeEngine())
-    _install_provisioner(monkeypatch, lambda request: httpx.Response(200, json={"status": "ok"}))
+    monkeypatch.setattr(requests, "get", lambda url, timeout=None: _FakeResponse(200))
 
-    status_code, payload = await readiness_payload(
-        CheckpointerConfig(type="memory"),
-        stream_bridge=MemoryStreamBridge(),
-        provisioner_url="http://provisioner:8002",
-    )
+    status_code, payload = await readiness_payload(CheckpointerConfig(type="memory"), None, "http://provisioner:8002")
 
     assert status_code == 200
-    assert payload["provisioner"] == PROBE_OK
+    assert payload["provisioner"] == HEALTH_OK
 
 
-@pytest.mark.anyio
-async def test_readiness_deadline_only_fails_the_probes_that_overran(monkeypatch):
-    """A probe that ignores its budget must not erase the verdicts of the probes that finished.
-
-    Otherwise a wedged report-only provisioner probe would flip the whole
-    endpoint to 503 through the deadline path.
-    """
-    monkeypatch.setattr("app.gateway.health.get_engine", lambda: _FakeEngine())
-
-    async def _hanging(*args) -> str:
-        await asyncio.sleep(30)
-        return PROBE_OK
-
-    monkeypatch.setattr(health_module, "_probe_provisioner", _hanging)
-    monkeypatch.setattr(health_module, "_READINESS_DEADLINE_SECONDS", 0.1)
-
-    status_code, payload = await readiness_payload(
-        CheckpointerConfig(type="memory"),
-        stream_bridge=MemoryStreamBridge(),
-        provisioner_url="http://provisioner:8002",
+def _make_readiness_client(monkeypatch, *, provisioner_url: str = "", checkpointer_config=None) -> TestClient:
+    monkeypatch.setattr("app.gateway.health.get_engine", lambda: None)
+    monkeypatch.setattr(
+        "app.gateway.health.get_app_config",
+        lambda: SimpleNamespace(sandbox=SimpleNamespace(provisioner_url=provisioner_url)),
     )
-
-    assert status_code == 200
-    assert payload["status"] == "ready"
-    assert payload["database"] == PROBE_OK
-    assert payload["checkpointer"] == PROBE_NOT_CONFIGURED
-    assert payload["stream_bridge"] == PROBE_NOT_CONFIGURED
-    assert payload["provisioner"] == PROBE_UNREACHABLE
-
-
-# ---------------------------------------------------------------------------
-# HTTP route
-# ---------------------------------------------------------------------------
-
-
-def _ready_client(monkeypatch, *, stream_bridge, provisioner_url: str | None) -> TestClient:
-    """Build the real gateway app and wire the startup state the probe reads.
-
-    The lifespan is deliberately not run: the test pins the ``app.state``
-    contract the route depends on instead of booting persistence.
-    """
-    from app.gateway.app import create_app
-
-    app = create_app()
-    setattr(app.state, READINESS_CHECKPOINTER_CONFIG_ATTR, CheckpointerConfig(type="memory"))
-    setattr(app.state, READINESS_PROVISIONER_URL_ATTR, provisioner_url)
-    app.state.stream_bridge = stream_bridge
-    monkeypatch.setattr("app.gateway.health.get_engine", lambda: _FakeEngine())
+    app = FastAPI()
+    register_readiness_route(app)
+    # ``langgraph_runtime`` always records the startup snapshot before serving;
+    # a missing snapshot is a separate fail-closed contract covered above.
+    app.state.checkpointer_config = checkpointer_config or CheckpointerConfig(type="memory")
     return TestClient(app)
 
 
-def test_health_ready_route_reports_every_dependency(monkeypatch):
-    _install_provisioner(monkeypatch, lambda request: httpx.Response(200, json={"status": "ok"}))
-    client = _ready_client(monkeypatch, stream_bridge=_FakeCrossProcessBridge(result=True), provisioner_url="http://provisioner:8002")
-
-    response = client.get("/health/ready")
-
-    assert response.status_code == 200
-    assert response.json() == {
-        "status": "ready",
-        "service": "deer-flow-gateway",
-        "database": PROBE_OK,
-        "checkpointer": PROBE_NOT_CONFIGURED,
-        "stream_bridge": PROBE_OK,
-        "provisioner": PROBE_OK,
-    }
-
-
-def test_health_ready_route_returns_503_when_stream_bridge_unreachable(monkeypatch):
-    client = _ready_client(monkeypatch, stream_bridge=_FakeCrossProcessBridge(result=False), provisioner_url=None)
+def test_readiness_route_degrades_when_stream_bridge_unreachable(monkeypatch):
+    """Route level: app.state wiring must reach the payload (issue #6446)."""
+    client = _make_readiness_client(monkeypatch)
+    client.app.state.checkpointer_config = CheckpointerConfig(type="memory")
+    client.app.state.stream_bridge = _FakeBridge(HEALTH_UNREACHABLE)
 
     response = client.get("/health/ready")
 
     assert response.status_code == 503
     body = response.json()
     assert body["status"] == "degraded"
-    assert body["stream_bridge"] == PROBE_UNREACHABLE
-    assert body["provisioner"] == PROBE_NOT_CONFIGURED
+    assert body["database"] == DATABASE_NOT_CONFIGURED
+    assert body["checkpointer"] == DATABASE_NOT_CONFIGURED
+    assert body["stream_bridge"] == HEALTH_UNREACHABLE
+    assert body["provisioner"] == HEALTH_NOT_CONFIGURED
 
 
-def test_health_ready_route_keeps_200_when_only_provisioner_is_down(monkeypatch):
-    def _handler(request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("connection refused", request=request)
-
-    _install_provisioner(monkeypatch, _handler)
-    client = _ready_client(monkeypatch, stream_bridge=MemoryStreamBridge(), provisioner_url="http://provisioner:8002")
+def test_readiness_route_ready_when_nothing_configured(monkeypatch):
+    """A bare app with no state attrs and memory backends must stay ready."""
+    client = _make_readiness_client(monkeypatch)
 
     response = client.get("/health/ready")
 
     assert response.status_code == 200
-    assert response.json()["provisioner"] == PROBE_UNREACHABLE
+    body = response.json()
+    assert body["status"] == "ready"
+    assert body["stream_bridge"] == HEALTH_NOT_CONFIGURED
+    assert body["provisioner"] == HEALTH_NOT_CONFIGURED
 
 
-def test_health_liveness_route_stays_200_while_readiness_is_degraded(monkeypatch):
-    """``GET /health`` is liveness only: an unreachable bridge or database must never restart the pod.
+def test_readiness_route_reports_provisioner_health_from_app_config(monkeypatch):
+    monkeypatch.setattr(requests, "get", lambda url, timeout=None: _FakeResponse(200))
+    client = _make_readiness_client(monkeypatch, provisioner_url="http://provisioner:8002/")
 
-    Readiness pulling the pod out of the Service is the intended reaction to a
-    Redis or database outage; the liveness probe moving with it would turn the
-    same outage into a restart loop.
-    """
-    client = _ready_client(monkeypatch, stream_bridge=_FakeCrossProcessBridge(result=False), provisioner_url=None)
-    monkeypatch.setattr("app.gateway.health.get_engine", lambda: _FakeEngine(unreachable=True))
+    response = client.get("/health/ready")
 
-    assert client.get("/health/ready").status_code == 503
-    live = client.get("/health")
-    assert live.status_code == 200
-    assert live.json() == {"status": "healthy", "service": "deer-flow-gateway"}
+    assert response.status_code == 200
+    assert response.json()["provisioner"] == HEALTH_OK
+
+
+def test_readiness_route_provisioner_unreachable_does_not_degrade(monkeypatch):
+    def _boom(url, timeout=None):
+        raise requests.ConnectionError("connection refused")
+
+    monkeypatch.setattr(requests, "get", _boom)
+    client = _make_readiness_client(monkeypatch, provisioner_url="http://provisioner:8002")
+
+    response = client.get("/health/ready")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ready"
+    assert body["provisioner"] == HEALTH_UNREACHABLE
