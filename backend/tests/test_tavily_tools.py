@@ -233,3 +233,105 @@ async def test_web_fetch_preserves_unsuccessful_extract_results(response, expect
         output = await web_fetch_tool.ainvoke({"url": "https://example.com/report"})
 
     assert output == expected
+
+
+_SEARCH_FORMAT_ERROR = json.dumps(
+    {"error": "Tavily returned an unexpected response format", "query": "documentation"},
+    ensure_ascii=False,
+)
+_FETCH_FORMAT_ERROR = "Error: Tavily returned an unexpected response format"
+
+
+def _client_returning(response: object) -> MagicMock:
+    client = MagicMock(spec=AsyncTavilyClient)
+    client.search = AsyncMock(return_value=response)
+    client.extract = AsyncMock(return_value=response)
+    return client
+
+
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        # Malformed shapes must return the structured format error, not raise.
+        ({"results": {"0": "garbage"}}, _SEARCH_FORMAT_ERROR),
+        ({"results": False}, _SEARCH_FORMAT_ERROR),
+        ({"results": ["garbage"]}, _SEARCH_FORMAT_ERROR),
+        ({"results": [None]}, _SEARCH_FORMAT_ERROR),
+        ({"results": [{"title": "T"}]}, _SEARCH_FORMAT_ERROR),
+        ({"results": [{"title": "T", "url": "u", "content": "c"}, {"url": "u"}]}, _SEARCH_FORMAT_ERROR),
+        (["not", "a", "dict"], _SEARCH_FORMAT_ERROR),
+        # Missing, null and empty results keep returning "[]".
+        ({"results": None}, "[]"),
+        ({"results": []}, "[]"),
+        ({}, "[]"),
+    ],
+)
+@pytest.mark.anyio
+async def test_web_search_contains_malformed_payloads(response, expected) -> None:
+    client = _client_returning(response)
+
+    with (
+        patch("deerflow.community.tavily.tools._get_tavily_client", return_value=client),
+        patch("deerflow.community.tavily.tools.get_app_config") as mock_config,
+    ):
+        mock_config.return_value.get_tool_config.return_value = None
+        output = await web_search_tool.ainvoke({"query": "documentation"})
+
+    assert output == expected
+
+
+@pytest.mark.anyio
+async def test_web_search_normalizes_well_formed_results_in_order() -> None:
+    response = {
+        "results": [
+            {"title": "B", "url": "https://example.com/b", "content": "second"},
+            {"title": "A", "url": "https://example.com/a", "content": "first"},
+        ]
+    }
+    client = _client_returning(response)
+
+    with (
+        patch("deerflow.community.tavily.tools._get_tavily_client", return_value=client),
+        patch("deerflow.community.tavily.tools.get_app_config") as mock_config,
+    ):
+        mock_config.return_value.get_tool_config.return_value = None
+        output = await web_search_tool.ainvoke({"query": "documentation"})
+
+    assert json.loads(output) == [
+        {"title": "B", "url": "https://example.com/b", "snippet": "second"},
+        {"title": "A", "url": "https://example.com/a", "snippet": "first"},
+    ]
+
+
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        # Malformed shapes must return the plain-text format error, not raise.
+        ({"failed_results": False}, _FETCH_FORMAT_ERROR),
+        ({"failed_results": [None]}, _FETCH_FORMAT_ERROR),
+        # A wrong-but-falsy results container is a format error, not "nothing
+        # found" (the #6550 rule: validate the container type before emptiness).
+        ({"results": {}}, _FETCH_FORMAT_ERROR),
+        ({"results": [None]}, _FETCH_FORMAT_ERROR),
+        ({"results": [{"url": "u"}]}, _FETCH_FORMAT_ERROR),
+        ({"results": [{"title": "T", "raw_content": 123}]}, _FETCH_FORMAT_ERROR),
+        (["not", "a", "dict"], _FETCH_FORMAT_ERROR),
+        # A valid entry object without a usable error message still reports a
+        # failure with the generic message instead of raising KeyError.
+        ({"failed_results": [{}]}, "Error: Extraction failed"),
+        ({"failed_results": [{"error": 123}]}, "Error: Extraction failed"),
+        ({"failed_results": [{"error": "x"}, {"error": 123}]}, "Error: x"),
+        # Missing, null and empty results keep returning "No results found".
+        ({"failed_results": None}, "Error: No results found"),
+        ({"results": []}, "Error: No results found"),
+        ({}, "Error: No results found"),
+    ],
+)
+@pytest.mark.anyio
+async def test_web_fetch_contains_malformed_payloads(response, expected) -> None:
+    client = _client_returning(response)
+
+    with patch("deerflow.community.tavily.tools._get_tavily_client", return_value=client):
+        output = await web_fetch_tool.ainvoke({"url": "https://example.com/report"})
+
+    assert output == expected

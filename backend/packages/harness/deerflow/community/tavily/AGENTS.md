@@ -18,3 +18,30 @@ in `backend/tests/test_tavily_tools.py` pin SDK arguments and the tool schema.
 For non-empty `include_domains`, explicitly send `include_domains_mode="filter"`
 through the SDK's keyword arguments; inclusion must restrict sources rather than
 boost them. Omit the mode when the include list is absent or empty.
+
+Malformed 200 payloads must never escape the tool boundary. Both tools
+normalize the SDK's decoded body through shape validation and return the
+provider's own structured error instead of raising: `web_search` returns
+`{"error": "Tavily returned an unexpected response format", "query": ...}`
+and `web_fetch` returns `Error: Tavily returned an unexpected response
+format`, matching brave (#6550), serper, serply, sofya, tencent_wsa,
+unbrowse and groundroute (#6603). Keep the boundary between "no results"
+and "malformed":
+
+- A missing, null or empty `results` container keeps returning today's
+  no-results output (`[]` / `Error: No results found`); some APIs signal
+  "no results" with a null field, so null is not malformed.
+- Validate the container type before the empty check (the #6550 rule): a
+  wrong-but-falsy container (e.g. `results: {}`) is a format error, not
+  "nothing found".
+- `web_search` requires every entry to be an object with string `title`,
+  `url` and `content` leaves (normalized to `title`/`url`/`snippet`).
+- `web_fetch` requires the first `results` entry to be an object with a
+  string `raw_content` leaf; `title` stays optional. A valid
+  `failed_results` entry object without a usable `error` message reports
+  `Error: Extraction failed` instead of raising `KeyError`; a non-object
+  entry is malformed.
+
+Regressions live in `backend/tests/test_tavily_tools.py`; keep the SDK's
+own missing-key mapping (a missing `results` key arrives as `[]`) in mind
+when pinning offline payloads.
